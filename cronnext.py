@@ -9,9 +9,11 @@ Exit code 0 = valid, 2 = invalid expression.
 import argparse
 import calendar
 import datetime
+import json
+import re
 import sys
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 MACROS = {
     "@yearly": "0 0 1 1 *", "@annually": "0 0 1 1 *", "@monthly": "0 0 1 * *",
@@ -63,6 +65,8 @@ def parse_field(text, spec):
         elif "-" in rng:
             x, y = rng.split("-", 1)
             a, b = _num(x, lo, hi, names, field), _num(y, lo, hi, names, field)
+            if field == "day-of-week" and b == 0 and a > 0 and y.lower() in ("sun", "0"):
+                b = 7  # "mon-sun" or "1-0" means through Sunday, which cron also writes as 7
             if a > b:
                 raise CronError("%s: range %s is reversed" % (field, rng))
         else:
@@ -165,24 +169,155 @@ def explain(expr):
     return text[0].upper() + text[1:]
 
 
+def get_zone(name):
+    """zoneinfo.ZoneInfo for ``name`` with a clear error when the zone or the tz database is missing."""
+    try:
+        import zoneinfo
+        return zoneinfo.ZoneInfo(name)
+    except ImportError:
+        raise CronError("time zones need Python 3.9+ (zoneinfo)")
+    except Exception:  # ZoneInfoNotFoundError, ValueError for malformed keys
+        raise CronError("unknown time zone %r (on Windows, `pip install tzdata`)" % name)
+
+
+def to_zoned(naive, run_zone, show_zone):
+    """(aware datetime in show_zone, dst_gap) for a wall-clock run time in run_zone."""
+    aware = naive.replace(tzinfo=run_zone)
+    utc = aware.astimezone(datetime.timezone.utc)
+    gap = utc.astimezone(run_zone).replace(tzinfo=None) != naive  # that wall-clock time does not exist
+    return utc.astimezone(show_zone), gap
+
+
+def gap_stats(runs):
+    """Shortest/longest gap (minutes) and average runs per day over a list of datetimes."""
+    if len(runs) < 2:
+        return None
+    gaps = [(b - a).total_seconds() / 60 for a, b in zip(runs, runs[1:])]
+    span_days = (runs[-1] - runs[0]).total_seconds() / 86400
+    return {"runs_examined": len(runs), "shortest_gap_minutes": min(gaps), "longest_gap_minutes": max(gaps),
+            "average_runs_per_day": round((len(runs) - 1) / span_days, 2) if span_days else None}
+
+
+def fmt_minutes(m):
+    m = int(round(m))
+    if m < 120:
+        return "%d min" % m
+    if m < 2880:
+        return "%.1f h" % (m / 60)
+    return "%.1f days" % (m / 1440)
+
+
+def parse_crontab(text, system=False):
+    """Yield (lineno, schedule, command, user_or_None, error_or_None) for each job line."""
+    for no, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#") or re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", line):
+            continue
+        toks = line.split()
+        if toks[0].startswith("@"):
+            schedule, rest = toks[0], toks[1:]
+        else:
+            if len(toks) < 6:
+                yield no, line, "", None, "expected 5 schedule fields and a command"
+                continue
+            schedule, rest = " ".join(toks[:5]), toks[5:]
+        user = None
+        if system:
+            if not rest:
+                yield no, schedule, "", None, "system crontab line needs a user and a command"
+                continue
+            user, rest = rest[0], rest[1:]
+        yield no, schedule, " ".join(rest), user, None
+
+
+def crontab_report(text, start, system, count):
+    results, bad = [], False
+    for no, schedule, command, user, err in parse_crontab(text, system):
+        entry = {"line": no, "schedule": schedule, "command": command, "user": user, "valid": err is None}
+        if err is None and schedule.lower() == "@reboot":
+            entry.update(explanation="At system start (no schedule to compute)", next_runs=[])
+        elif err is None:
+            try:
+                entry["explanation"] = explain(schedule)
+                entry["next_runs"] = [dt.strftime("%Y-%m-%d %H:%M") for dt in next_runs(schedule, start, count)]
+            except ValueError as exc:
+                err = str(exc)
+        if err is not None:
+            entry.update(valid=False, error=err)
+            bad = True
+        results.append(entry)
+    return results, bad
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Explain a cron expression and show its next runs.")
-    ap.add_argument("expression", help='5-field cron expression or macro, e.g. "*/5 * * * *"')
+    ap.add_argument("expression", nargs="?", help='5-field cron expression or macro, e.g. "*/5 * * * *"')
     ap.add_argument("-n", "--count", type=int, default=5, help="number of runs to show (default 5)")
     ap.add_argument("--from", dest="start", help="start time 'YYYY-MM-DD HH:MM' (default: now)")
+    ap.add_argument("--tz", help="time zone the schedule runs in, e.g. UTC or Europe/Istanbul (default: naive local time)")
+    ap.add_argument("--show-in", help="also show the runs in this time zone")
+    ap.add_argument("--summary", action="store_true", help="shortest/longest gap and runs per day over the next 500 runs")
+    ap.add_argument("--crontab", metavar="FILE", help="validate and explain every job in a crontab file (- for stdin)")
+    ap.add_argument("--system", action="store_true", help="with --crontab: lines have a user column (/etc/cron.d style)")
+    ap.add_argument("--json", action="store_true", help="machine-readable output")
     ap.add_argument("--version", action="version", version=__version__)
     args = ap.parse_args(argv)
     try:
         start = datetime.datetime.strptime(args.start, "%Y-%m-%d %H:%M") if args.start \
             else datetime.datetime.now()
-        print(explain(args.expression))
-        for dt in next_runs(args.expression, start, max(1, args.count)):
-            print("  %s %s" % (dt.strftime("%Y-%m-%d %H:%M"), calendar.day_abbr[dt.weekday()]))
+        count = max(1, args.count)
+        if args.crontab:
+            text = sys.stdin.read() if args.crontab == "-" else open(args.crontab, encoding="utf-8", errors="replace").read()
+            results, bad = crontab_report(text, start, args.system, count)
+            if args.json:
+                print(json.dumps(results, indent=2))
+            else:
+                for r in results:
+                    print("line %d: %s%s" % (r["line"], r["schedule"], "  ->  " + r["command"] if r["command"] else ""))
+                    if not r["valid"]:
+                        print("  INVALID: %s" % r["error"])
+                        continue
+                    print("  %s" % r["explanation"])
+                    for t in r["next_runs"][:count]:
+                        print("    next %s" % t)
+                print("cronnext: %d job(s), %d invalid" % (len(results), sum(1 for r in results if not r["valid"])), file=sys.stderr)
+            return 2 if bad else 0
+        if not args.expression:
+            ap.print_usage(sys.stderr)
+            return 2
+        run_zone = get_zone(args.tz) if args.tz else None
+        show_zone = get_zone(args.show_in) if args.show_in else run_zone
+        runs = next_runs(args.expression, start, max(count, 500) if args.summary else count)
+        explanation = explain(args.expression)
+        shown = []
+        for dt in runs[:count]:
+            entry = {"time": dt.strftime("%Y-%m-%d %H:%M"), "weekday": calendar.day_abbr[dt.weekday()]}
+            if run_zone is not None:
+                local, gap = to_zoned(dt, run_zone, show_zone)
+                entry.update(time=local.strftime("%Y-%m-%d %H:%M %z"), weekday=calendar.day_abbr[local.weekday()],
+                             dst_gap=gap)
+            shown.append(entry)
+        stats = gap_stats(runs) if args.summary else None
+        if args.json:
+            out = {"expression": args.expression, "explanation": explanation, "runs": shown}
+            if stats:
+                out["summary"] = stats
+            print(json.dumps(out, indent=2))
+        else:
+            print(explanation)
+            for e in shown:
+                print("  %s %s%s" % (e["time"], e["weekday"], "  (DST gap: this wall-clock time does not exist)" if e.get("dst_gap") else ""))
+            if stats:
+                print("Over the next %d runs: shortest gap %s, longest gap %s, about %s run(s) per day" % (
+                    stats["runs_examined"], fmt_minutes(stats["shortest_gap_minutes"]),
+                    fmt_minutes(stats["longest_gap_minutes"]), stats["average_runs_per_day"]))
+    except OSError as exc:
+        print("cronnext: %s" % exc, file=sys.stderr)
+        return 2
     except ValueError as exc:  # includes CronError
         print("cronnext: %s" % exc, file=sys.stderr)
         return 2
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())
